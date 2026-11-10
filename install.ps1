@@ -9,8 +9,8 @@ $asset = 'colla-windows-x64.zip'
 $stage = Join-Path ([IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString())
 New-Item -ItemType Directory -Path $stage | Out-Null
 try {
-    Invoke-WebRequest "$base/$asset" -OutFile (Join-Path $stage $asset)
-    Invoke-WebRequest "$base/$asset.sha256" -OutFile (Join-Path $stage 'checksum')
+    Invoke-WebRequest "$base/$asset" -UseBasicParsing -OutFile (Join-Path $stage $asset)
+    Invoke-WebRequest "$base/$asset.sha256" -UseBasicParsing -OutFile (Join-Path $stage 'checksum')
     $expected = ((Get-Content -Raw (Join-Path $stage 'checksum')) -split '\s+')[0]
     $actual = (Get-FileHash (Join-Path $stage $asset) -Algorithm SHA256).Hash
     if ($actual -ne $expected) { throw 'Checksum mismatch; nothing installed.' }
