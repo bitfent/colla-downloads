@@ -1,0 +1,235 @@
+name: Build CLI release
+
+# On-demand release builds for the Colla CLI.
+#
+# The application source lives in the private repository bitfent/colla. This
+# workflow checks it out at a chosen commit or tag, builds the release binary
+# on each supported platform, runs the same native CLI checks the private CI
+# runs, and publishes a release here with the archives, their SHA-256 files,
+# and the two installers. It reads the source with the repository secret
+# COLLA_SOURCE_TOKEN: a fine-grained personal access token whose only
+# permission is read-only Contents on bitfent/colla.
+#
+# Nothing here prints source file contents. Compiler output is written to a
+# file and only diagnostic headlines are shown if a build fails. No build cache
+# is used, so no compiled source ever lands in this public repository's cache.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Commit or tag of bitfent/colla to build
+        required: true
+        default: main
+      version:
+        description: Release tag to publish here, such as v0.2.1
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: bitfent/colla
+
+jobs:
+  prepare:
+    name: Resolve the source commit
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Check the inputs
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          case "$SOURCE_REF" in
+            ''|-*|*..*|*[!A-Za-z0-9._/-]*)
+              echo "::error::source_ref must be a commit, branch or tag name of $SOURCE_REPOSITORY."
+              exit 1 ;;
+          esac
+          if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$'; then
+            echo "::error::version must be a release tag such as v0.2.1."
+            exit 1
+          fi
+      - name: Require the source token
+        env:
+          COLLA_SOURCE_TOKEN: ${{ secrets.COLLA_SOURCE_TOKEN }}
+        run: |
+          if [ -z "$COLLA_SOURCE_TOKEN" ]; then
+            echo "::error::The repository secret COLLA_SOURCE_TOKEN is not set, so the private source cannot be read."
+            echo "Create a fine-grained personal access token (GitHub > Settings > Developer settings > Fine-grained tokens):"
+            echo "  resource owner: the owner of $SOURCE_REPOSITORY; repository access: only $SOURCE_REPOSITORY;"
+            echo "  repository permissions: Contents = Read-only (Metadata is added automatically); no other permissions."
+            echo "Then add it to this repository as the Actions secret COLLA_SOURCE_TOKEN, for example:"
+            echo "  gh secret set COLLA_SOURCE_TOKEN --repo $GITHUB_REPOSITORY"
+            exit 1
+          fi
+      - name: Resolve the source commit
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.COLLA_SOURCE_TOKEN }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          if ! sha=$(gh api "repos/$SOURCE_REPOSITORY/commits/$SOURCE_REF" --jq .sha); then
+            echo "::error::Could not read $SOURCE_REPOSITORY at '$SOURCE_REF'. Check that the ref exists and that COLLA_SOURCE_TOKEN still has read-only Contents access to $SOURCE_REPOSITORY."
+            exit 1
+          fi
+          echo "Building $SOURCE_REPOSITORY at $sha (requested: $SOURCE_REF)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Make sure the release does not exist yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $VERSION already exists in $GITHUB_REPOSITORY. Pick a new version."
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag $VERSION already exists in $GITHUB_REPOSITORY. Pick a new version."
+            exit 1
+          fi
+
+  native:
+    name: Build and test (${{ matrix.os }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15, macos-15-intel, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      DATABASE_URL: postgres://colla@localhost:5432/colla
+      APP_BASE_URL: http://127.0.0.1:8080
+      MAILER: log
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - name: Check out the private source
+        uses: actions/checkout@v4
+        with:
+          repository: bitfent/colla
+          ref: ${{ needs.prepare.outputs.sha }}
+          token: ${{ secrets.COLLA_SOURCE_TOKEN }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ankane/setup-postgres@1adb52d4692fddc409e252bd72c32904fd6ce9b4
+        with:
+          database: colla
+          user: colla
+      - name: Windows crypto build tools
+        if: runner.os == 'Windows'
+        run: choco install nasm --no-progress -y
+      - name: Add NASM to path
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append'
+      - name: Build the release binaries
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/cargo-build.log"
+          status=0
+          cargo build --locked --release --bins >"$log" 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            # Headlines and locations only; the source lines rustc quotes stay out of this public log.
+            grep -E '^(error|warning)(\[[A-Z0-9]+\])?: |^ *--> |^error: could not compile' "$log" | head -n 100 || true
+            echo "::error::cargo build failed with exit code $status. Diagnostics above are headlines only; build the commit locally for the full output."
+            exit "$status"
+          fi
+          tail -n 1 "$log"
+      - name: Run the native CLI checks
+        run: python tests/native_cli.py
+      - name: Package
+        run: python scripts/package-cli.py
+      - name: Smoke-test the built binary and the checksums
+        shell: bash
+        run: |
+          bin=target/release/colla
+          if [ "$RUNNER_OS" = Windows ]; then bin=target/release/colla.exe; fi
+          "$bin" --version
+          "$bin" --help >/dev/null
+          cd dist
+          ls -l
+          if command -v sha256sum >/dev/null 2>&1; then sha256sum -c ./*.sha256; else shasum -a 256 -c ./*.sha256; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.os }}
+          path: source/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish the release
+    needs: [prepare, native]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out this repository for the installers
+        uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check the assets
+        working-directory: dist
+        run: |
+          for archive in colla-linux-x64.tar.gz colla-linux-arm64.tar.gz colla-macos-x64.tar.gz colla-macos-arm64.tar.gz colla-windows-x64.zip; do
+            test -s "$archive" || { echo "::error::Missing $archive"; exit 1; }
+            test -s "$archive.sha256" || { echo "::error::Missing $archive.sha256"; exit 1; }
+          done
+          sha256sum -c ./*.sha256
+          ls -l
+      - name: Write the release notes
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          Colla CLI ${VERSION#v}
+
+          Native binaries for Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows x64. Each platform ran the real CLI and server checks (join, read, offline catch-up, export, credential permissions, browser-approved login, MCP bridge, operator stop, and managed listener startup) before this release was published.
+
+          Built from Colla source commit \`$SOURCE_SHA\` (requested as \`$SOURCE_REF\`) by workflow run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. This public repository contains binary downloads and installers only; application source remains private.
+
+          Install on macOS or Linux:
+
+          \`\`\`sh
+          curl -fsSL https://colla.computer/install.sh | sh
+          \`\`\`
+
+          Install on Windows from PowerShell:
+
+          \`\`\`powershell
+          irm https://colla.computer/install.ps1 | iex
+          \`\`\`
+
+          The installers verify SHA-256 before installing. Manual downloads have matching \`.sha256\` files. Windows ARM64 is not included. Managed Ollama listening runs in the foreground and reads only the folder you select; it does not install an always-on operating-system service.
+
+          Documentation: https://colla.computer/docs/connect
+          Machine-readable documentation: https://colla.computer/docs.md
+          EOF
+          cat "$RUNNER_TEMP/notes.md"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release create "$VERSION" dist/* install.sh install.ps1 \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
+            --title "Colla CLI ${VERSION#v}" --notes-file "$RUNNER_TEMP/notes.md"
+          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/$VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
