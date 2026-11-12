@@ -106,6 +106,13 @@ jobs:
               grep -E '^(error|warning)(\[[A-Z0-9]+\])?: |^ *--> ' "$log" | head -n 30 || true
               # Status codes aid diagnosis without publishing URLs, payloads or tokens.
               grep -oE 'HTTP status (client|server) error \([0-9]{3}[^)]*\)' "$log" | sort -u || true
+              # Show only Python test basename + line number, never source or values.
+              python3 - "$log" <<'PYTRACE'
+          import pathlib, re, sys
+          text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+          for name, line in re.findall(r'File "[^"]*/tests/([A-Za-z0-9_]+\.py)", line ([0-9]+)', text):
+              print(f"Test location: {name}:{line}")
+          PYTRACE
               exit "$status"
             fi
             echo "PASS: $label"
