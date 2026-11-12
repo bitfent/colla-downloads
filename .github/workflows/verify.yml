@@ -76,7 +76,7 @@ jobs:
             # Suites share an isolated database, not an IP rate-limit budget.
             # Keep each suite's own rate-limit assertions intact.
             case "$label" in
-              behavior|connectors|mcp|cli|recovery|login-retry|managed-startup|resilience|presence|onboarding|fresh-agent|renewal|inbox|browser)
+              team-room|behavior|connectors|mcp|cli|recovery|login-retry|managed-startup|resilience|presence|onboarding|fresh-agent|renewal|inbox|browser)
                 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'TRUNCATE rate_buckets' >/dev/null
                 # Failed-lookup protection is intentionally in memory. Integration
                 # tests exhaust it; give each independent suite a fresh process too.
@@ -137,6 +137,7 @@ jobs:
           echo $! > .local/server.pid
           for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:8080/healthz >/dev/null && exit 0; sleep 1; done
           echo "::error::Local server did not become healthy"; exit 1
+      - run: check team-room python3 tests/team_room.py
       - run: check behavior python3 tests/integration.py
       - run: check connectors python3 tests/connectors_live.py
       - run: check mcp cargo test --locked --test mcp_live -- --ignored
@@ -156,7 +157,7 @@ jobs:
       - name: Check deterministic browser assets
         run: |
           check assets npm run build:landing
-          check asset-drift git diff --exit-code -- static/landing static/app static/social src/landing-assets.html src/brand-version.txt src/app-version.txt src/og-asset.txt
+          check asset-drift git diff --exit-code -- static/landing static/app static/social src/landing-assets.html src/brand-version.txt src/app-version.txt src/team-assets.html src/og-asset.txt
       - run: check chromium npx playwright install --with-deps chromium
       - run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'TRUNCATE rate_buckets'
       - run: check browser npm test
