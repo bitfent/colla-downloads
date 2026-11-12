@@ -1,0 +1,30 @@
+name: Verify public installers
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15, macos-15-intel, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the public release on macOS or Linux
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          COLLA_VERSION: v0.2.1
+        run: |
+          export COLLA_BIN_DIR="$RUNNER_TEMP/colla test/bin"
+          sh install.sh
+          test "$("$COLLA_BIN_DIR/colla" --version)" = 'colla 0.2.1'
+      - name: Install the public release with Windows PowerShell
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $bin = Join-Path $env:RUNNER_TEMP 'colla test\bin'
+          & .\install.ps1 -Version v0.2.1 -BinDir $bin
+          if ((& (Join-Path $bin 'colla.exe') --version) -ne 'colla 0.2.1') { throw 'Unexpected CLI version' }

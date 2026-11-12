@@ -1,0 +1,152 @@
+name: Verify Colla
+
+# Private source is checked out read-only at one resolved commit. No source,
+# compiler cache, browser trace or raw test log is uploaded to this public repo.
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Commit, branch or tag of bitfent/colla to verify
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ inputs.source_ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve the private source commit
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.COLLA_SOURCE_TOKEN }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          case "$SOURCE_REF" in
+            ''|-*|*..*|*[!A-Za-z0-9._/-]*) echo "::error::Invalid source ref"; exit 1 ;;
+          esac
+          sha=$(gh api "repos/bitfent/colla/commits/$SOURCE_REF" --jq .sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Verifying source commit $sha" >> "$GITHUB_STEP_SUMMARY"
+
+  product:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: colla
+          POSTGRES_PASSWORD: colla-local
+          POSTGRES_DB: colla
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U colla"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://colla:colla-local@127.0.0.1:55432/colla
+      APP_BASE_URL: http://127.0.0.1:8080
+      COLLA_TEST_URL: http://127.0.0.1:8080
+      MAILER: log
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bitfent/colla
+          ref: ${{ needs.prepare.outputs.sha }}
+          token: ${{ secrets.COLLA_SOURCE_TOKEN }}
+          path: source
+          persist-credentials: false
+      - name: Keep private diagnostics off the public log
+        run: |
+          cat > "$RUNNER_TEMP/colla-check.sh" <<'SH'
+          check() {
+            label="$1"; shift
+            log="$RUNNER_TEMP/check-$label.log"
+            status=0
+            "$@" >"$log" 2>&1 || status=$?
+            if [ "$status" -ne 0 ]; then
+              echo "::error::$label failed (exit $status). Reproduce at the resolved source commit for full private diagnostics."
+              # Rust headlines and locations contain no quoted source lines.
+              grep -E '^(error|warning)(\[[A-Z0-9]+\])?: |^ *--> ' "$log" | head -n 30 || true
+              exit "$status"
+            fi
+            echo "PASS: $label"
+          }
+          SH
+          echo "BASH_ENV=$RUNNER_TEMP/colla-check.sh" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: check format cargo fmt --check
+      - run: check clippy cargo clippy --locked --all-targets -- -D warnings
+      - run: check unit cargo test --locked
+      - run: check build cargo build --locked --bins
+      - run: check hosted-events cargo test --locked --test hosted_events -- --ignored --test-threads=1
+      - name: Start the isolated server
+        run: |
+          mkdir -p .local
+          nohup target/debug/colla-server > .local/server.log 2>&1 &
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:8080/healthz >/dev/null && exit 0; sleep 1; done
+          echo "::error::Local server did not become healthy"; exit 1
+      - run: check behavior python3 tests/integration.py
+      - run: check connectors python3 tests/connectors_live.py
+      - run: check mcp cargo test --locked --test mcp_live -- --ignored
+      - run: check cli python3 tests/cli_live.py
+      - run: check recovery python3 tests/recovery_live.py
+      - run: check login-retry python3 tests/login_retry.py
+      - run: check managed-startup python3 tests/managed_startup.py
+      - run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'TRUNCATE rate_buckets'
+      - run: check resilience python3 tests/resilience_live.py
+      - run: check presence python3 tests/presence_live.py
+      - run: check onboarding python3 tests/onboarding_live.py
+      - run: check fresh-agent python3 tests/fresh_agent_live.py
+      - run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'TRUNCATE rate_buckets'
+      - run: check renewal cargo test --locked --test renewal_live -- --ignored
+      - run: check inbox cargo test --locked --test inbox_rows_live -- --ignored
+      - run: check npm npm ci
+      - name: Check deterministic browser assets
+        run: |
+          check assets npm run build:landing
+          check asset-drift git diff --exit-code -- static/landing static/app static/social src/landing-assets.html src/brand-version.txt src/app-version.txt src/og-asset.txt
+      - run: check chromium npx playwright install --with-deps chromium
+      - run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'TRUNCATE rate_buckets'
+      - run: check browser npm test
+      - name: Summarize
+        run: echo "Product verification passed for ${{ needs.prepare.outputs.sha }}. No private diagnostics or source artifacts were published." >> "$GITHUB_STEP_SUMMARY"
+
+  container:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bitfent/colla
+          ref: ${{ needs.prepare.outputs.sha }}
+          token: ${{ secrets.COLLA_SOURCE_TOKEN }}
+          path: source
+          persist-credentials: false
+      - name: Build the runtime image without publishing source layers or raw logs
+        working-directory: source
+        run: |
+          status=0
+          docker build --quiet --tag colla:check . > "$RUNNER_TEMP/container.log" 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Container build failed (exit $status). Reproduce locally at the resolved source commit for private diagnostics."
+            exit "$status"
+          fi
+          echo "Container build passed for ${{ needs.prepare.outputs.sha }}" >> "$GITHUB_STEP_SUMMARY"
