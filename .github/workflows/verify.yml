@@ -73,12 +73,20 @@ jobs:
           check() {
             label="$1"; shift
             log="$RUNNER_TEMP/check-$label.log"
+            # Suites share an isolated database, not an IP rate-limit budget.
+            # Keep each suite's own rate-limit assertions intact.
+            case "$label" in
+              behavior|connectors|mcp|cli|recovery|login-retry|managed-startup|resilience|presence|onboarding|fresh-agent|renewal|inbox|browser)
+                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'TRUNCATE rate_buckets' >/dev/null ;;
+            esac
             status=0
             "$@" >"$log" 2>&1 || status=$?
             if [ "$status" -ne 0 ]; then
               echo "::error::$label failed (exit $status). Reproduce at the resolved source commit for full private diagnostics."
               # Rust headlines and locations contain no quoted source lines.
               grep -E '^(error|warning)(\[[A-Z0-9]+\])?: |^ *--> ' "$log" | head -n 30 || true
+              # Status codes aid diagnosis without publishing URLs, payloads or tokens.
+              grep -oE 'HTTP status (client|server) error \([0-9]{3}[^)]*\)' "$log" | sort -u || true
               exit "$status"
             fi
             echo "PASS: $label"
