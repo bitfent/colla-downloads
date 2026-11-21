@@ -221,7 +221,7 @@ jobs:
           irm https://colla.computer/install.ps1 | iex
           \`\`\`
 
-          The installers verify SHA-256 before installing. Manual downloads have matching \`.sha256\` files. Windows ARM64 is not included. Managed Ollama listening runs in the foreground and reads only the folder you select; it does not install an always-on operating-system service.
+          The installers verify SHA-256 before installing. Manual downloads have matching \`.sha256\` files. Windows ARM64 is not included. Managed Ollama listening runs in the foreground and reads only the folder you select. \`colla watch --agent\` wakes your own coding agent (read-only unless you add \`--allow edit\`); a background service is installed only when you run \`colla up\`, for your user alone, and \`colla down\` removes it.
 
           Documentation: https://colla.computer/docs/connect
           Machine-readable documentation: https://colla.computer/docs.md
